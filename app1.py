@@ -1,5 +1,4 @@
 import os
-import sqlite3
 import time
 import pandas as pd
 import requests
@@ -8,6 +7,9 @@ from pypdf import PdfReader
 import streamlit as st
 from dotenv import load_dotenv
 from openai import AzureOpenAI, APIError
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.orm import declarative_base, sessionmaker
+import base64
 
 # Carrega variáveis de ambiente
 load_dotenv(override=True)
@@ -17,7 +19,7 @@ API_KEY = os.getenv("API_KEY")
 API_VERSION = os.getenv("API_VERSION", "2025-04-01-preview")
 GPT5_MODEL = os.getenv("GPT5_MODEL")
 
-# Inicialização do Cliente Azure OpenAI com fallback
+# Inicialização segura do Cliente Azure OpenAI
 client = None
 try:
     if ENDPOINT and API_KEY:
@@ -29,47 +31,92 @@ try:
 except Exception as e:
     print(f"Erro ao inicializar cliente Azure: {e}")
 
-# --- GERENCIAMENTO DE MEMÓRIA (HISTÓRICO SQLite) ---
-def inicializar_banco_historico():
-    try:
-        con = sqlite3.connect('chat_history.db')
-        cursor = con.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS historico (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                role TEXT,
-                content TEXT
-            )
-        ''')
-        con.commit()
-        con.close()
-    except Exception as e:
-        print(f"Erro ao inicializar banco: {e}")
+# --- ARQUITETURA ORM (SQLALCHEMY) - FOCO EM ESTUDOS ---
+Base = declarative_base()
 
-def salvar_mensagem(role, content):
-    try:
-        con = sqlite3.connect('chat_history.db')
-        cursor = con.cursor()
-        cursor.execute('INSERT INTO historico (role, content) VALUES (?, ?)', (role, content))
-        con.commit()
-        con.close()
-    except Exception as e:
-        print(f"Erro ao salvar mensagem: {e}")
+class UsuarioModel(Base):
+    __tablename__ = 'usuarios'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String, unique=True, nullable=False)
+    senha = Column(String, nullable=False)
 
-def carregar_historico():
+class MateriaModel(Base):
+    __tablename__ = 'materias'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String, nullable=False)
+    nome = Column(String, nullable=False)
+    professor = Column(String)
+
+class TarefaModel(Base):
+    __tablename__ = 'tarefas_estudo'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String, nullable=False)
+    titulo = Column(String, nullable=False)
+    materia = Column(String)
+    prazo = Column(String)
+    status = Column(String, default="Pendente")
+
+class HistoricoModel(Base):
+    __tablename__ = 'historico_chat'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String)
+    role = Column(String)
+    content = Column(String)
+
+# Configuração do engine SQLite seguro via ORM
+engine = create_engine('sqlite:///banco_estudos.db', echo=False)
+Base.metadata.create_all(engine)
+SessionLocal = sessionmaker(bind=engine)
+
+def cadastrar_usuario(username, senha):
     try:
-        con = sqlite3.connect('chat_history.db')
-        cursor = con.cursor()
-        cursor.execute('SELECT role, content FROM historico')
-        mensagens = cursor.fetchall()
-        con.close()
-        return [{"role": r, "content": c} for r, c in mensagens]
+        session = SessionLocal()
+        existe = session.query(UsuarioModel).filter_by(username=username).first()
+        if existe:
+            session.close()
+            return False, "Usuário já existe!"
+        
+        novo_usuario = UsuarioModel(username=username, senha=senha)
+        session.add(novo_usuario)
+        session.commit()
+        session.close()
+        return True, "Cadastro realizado com sucesso!"
+    except Exception as e:
+        return False, f"Erro ao cadastrar: {e}"
+
+def autenticar_usuario(username, senha):
+    try:
+        session = SessionLocal()
+        usuario = session.query(UsuarioModel).filter_by(username=username, senha=senha).first()
+        session.close()
+        return usuario is not None
+    except Exception as e:
+        print(f"Erro na autenticação: {e}")
+        return False
+
+def salvar_historico_orm(username, role, content):
+    try:
+        session = SessionLocal()
+        nova_msg = HistoricoModel(username=username, role=role, content=content)
+        session.add(nova_msg)
+        session.commit()
+        session.close()
+    except Exception as e:
+        print(f"Erro ao salvar histórico: {e}")
+
+def carregar_historico_orm(username):
+    try:
+        session = SessionLocal()
+        mensagens = session.query(HistoricoModel).filter_by(username=username).all()
+        session.close()
+        return [{"role": m.role, "content": m.content} for m in mensagens]
     except Exception as e:
         print(f"Erro ao carregar histórico: {e}")
         return []
 
-# --- FUNÇÕES DE RETRIEVAL COM FALLBACKS ROBUSTOS ---
+# --- FUNÇÕES DE RETRIEVAL COM FALLBACKS ---
 
+@st.cache_data(ttl=1800)
 def raspar_site():
     url = "https://gratuitos.netlify.app/"
     try:
@@ -83,6 +130,7 @@ def raspar_site():
     except Exception as e:
         return f"[Fallback: Site indisponível - {e}]"
 
+@st.cache_data
 def ler_pdf():
     caminho_pdf = "arquivo.pdf"
     if not os.path.exists(caminho_pdf):
@@ -99,186 +147,268 @@ def ler_pdf():
     except Exception as e:
         return f"[Fallback: Erro ao ler PDF - {e}]"
 
-def carregar_dados_locais():
+def carregar_dados_academicos(username):
     try:
         if os.path.exists('dados.csv'):
             dados_csv = pd.read_csv('dados.csv').head(50).to_string()
         else:
             dados_csv = "[dados.csv não encontrado]"
     except Exception as e:
-        dados_csv = f"[Erro CSV 1: {e}]"
+        dados_csv = f"[Erro CSV: {e}]"
 
     try:
-        caminho_tic = 'tic.csv'
-        if not os.path.exists(caminho_tic) and os.path.exists('titanic.csv'):
-            caminho_tic = 'titanic.csv'
-        if os.path.exists(caminho_tic):
-            t_csv = pd.read_csv(caminho_tic).head(50).to_string()
-        else:
-            t_csv = "[tic.csv / titanic.csv não encontrado]"
+        session = SessionLocal()
+        tarefas = session.query(TarefaModel).filter_by(username=username).all()
+        materias = session.query(MateriaModel).filter_by(username=username).all()
+        
+        if not tarefas:
+            session.add(TarefaModel(username=username, titulo="Entrega do Projeto de IA", materia="Inteligência Artificial", prazo="Próxima Sexta", status="Pendente"))
+            session.add(TarefaModel(username=username, titulo="Lista de Exercícios ORM", materia="Banco de Dados", prazo="Segunda-feira", status="Pendente"))
+            session.commit()
+            tarefas = session.query(TarefaModel).filter_by(username=username).all()
+            
+        session.close()
+        
+        dados_estudo = f"Tarefas/Prazos: {str([(t.titulo, t.materia, t.prazo, t.status) for t in tarefas])}"
     except Exception as e:
-        t_csv = f"[Erro CSV 2: {e}]"
+        dados_estudo = f"[Erro ORM Acadêmico: {e}]"
 
-    try:
-        con = sqlite3.connect('banco.db')
-        cursor = con.cursor()
-        cursor.execute('''CREATE TABLE IF NOT EXISTS vendas(
-                         venda REAL,
-                         vendedor TEXT,
-                         id TEXT)''')
-        con.commit()
-        cursor.execute('SELECT * FROM vendas')
-        resultado = cursor.fetchall()
-        con.close()
-        dados_db = str(resultado) if resultado else "[Banco vendas vazio]"
-    except Exception as e:
-        dados_db = f"[Erro SQLite: {e}]"
+    return dados_csv, dados_estudo
 
-    return dados_csv, t_csv, dados_db
-
-# --- ORQUESTRADOR INTELIGENTE COM LOGS VISÍVEIS ---
-def orquestrar_com_logs(pergunta):
+# --- ORQUESTRADOR INTELIGENTE ACADÊMICO ---
+def orquestrar_estudos(pergunta, username):
     pergunta_lower = pergunta.lower()
     
-    foca_vendas = any(k in pergunta_lower for k in ["venda", "vendedor", "lucro", "id", "comissão"])
-    foca_cursos = any(k in pergunta_lower for k in ["curso", "aula", "endereço", "site", "institucional", "sobre"])
-    foca_documentos = any(k in pergunta_lower for k in ["pdf", "regulamento", "documento", "arquivo", "regra"])
-    foca_tic = any(k in pergunta_lower for k in ["titanic", "tic", "passageiro", "dados"])
+    foca_tarefas = any(k in pergunta_lower for k in ["tarefa", "prova", "prazo", "trabalho", "agenda", "estudar"])
+    foca_conteudo = any(k in pergunta_lower for k in ["curso", "aula", "materia", "conteudo", "resumo"])
+    foca_documentos = any(k in pergunta_lower for k in ["pdf", "regulamento", "documento", "regra", "apostila"])
 
-    # Criação do componente visual transparente para a professora ver
-    logs_execucao = []
+    logs = []
     contexto_final = ""
 
-    if not (foca_vendas or foca_cursos or foca_documentos or foca_tic):
-        logs_execucao.append("🌐 **Orquestração Geral**: Pergunta ampla detectada. Acionando **Fluxo Combinado** (Todas as bases)...")
+    if not (foca_tarefas or foca_conteudo or foca_documentos):
+        logs.append("🌐 **Orquestração Geral**: Acionando **Fluxo Acadêmico Completo** (Material, PDF e Agenda)...")
         site = raspar_site()
         pdf = ler_pdf()
-        csv1, csv2, db = carregar_dados_locais()
-        
-        logs_execucao.append("✅ Dados do Site carregados com sucesso.")
-        logs_execucao.append("✅ Documento PDF processado.")
-        logs_execucao.append("✅ Arquivos CSVs (Geral e TIC) integrados.")
-        logs_execucao.append("✅ Banco de Dados SQLite (Vendas) consultado.")
-        
+        csv_geral, agenda = carregar_dados_academicos(username)
+        logs.append("✅ Dados institucionais, apostilas e tarefas carregados.")
         contexto_final = f"""
-----[DADOS DO SITE]----
+----[CONTEÚDO DO SITE/CURSO]----
 {site}
-----[DADOS DO PDF]----
+----[APOSTILA / PDF]----
 {pdf}
-----[DADOS CSV 1]----
-{csv1}
-----[DADOS CSV 2 (TIC)]----
-{csv2}
-----[BANCO DE VENDAS]----
-{db}
+----[DADOS GERAIS]----
+{csv_geral}
+----[AGENDA E TAREFAS DO ALUNO]----
+{agenda}
 """
     else:
-        logs_execucao.append(f"🎯 **Orquestração Seletiva**: Intenção específica identificada na pergunta.")
-        contexto_final = "Contexto Direcionado:\n"
+        logs.append("🎯 **Orquestração Seletiva de Estudos**: Direcionando ferramentas...")
+        contexto_final = "Contexto Acadêmico Direcionado:\n"
         
-        if foca_cursos or "site" in pergunta_lower:
-            logs_execucao.append("🔍 Acionando ferramenta de **Scraping Web**...")
-            contexto_final += f"\n[DADOS DO SITE]:\n{raspar_site()}"
+        if foca_conteudo or "site" in pergunta_lower:
+            logs.append("🔍 Consultando Portal Educacional...")
+            contexto_final += f"\n[CONTEÚDO DO SITE]:\n{raspar_site()}"
         if foca_documentos or "pdf" in pergunta_lower:
-            logs_execucao.append("🔍 Acionando leitor de **Documento PDF**...")
-            contexto_final += f"\n[CONTEÚDO DO PDF]:\n{ler_pdf()}"
-        if foca_vendas:
-            logs_execucao.append("🔍 Acionando consulta ao **Banco SQLite (Vendas)**...")
-            _, _, db = carregar_dados_locais()
-            contexto_final += f"\n[BANCO DE VENDAS]:\n{db}"
-        if foca_tic or "titanic" in pergunta_lower:
-            logs_execucao.append("🔍 Acionando análise do **CSV TIC/Titanic**...")
-            _, csv2, _ = carregar_dados_locais()
-            contexto_final += f"\n[DADOS TIC/TITANIC]:\n{csv2}"
+            logs.append("🔍 Consultando Apostila em PDF...")
+            contexto_final += f"\n[APOSTILA / PDF]:\n{ler_pdf()}"
+        if foca_tarefas:
+            logs.append("🔍 Consultando Agenda e Prazos via ORM...")
+            _, agenda = carregar_dados_academicos(username)
+            contexto_final += f"\n[AGENDA DO ALUNO]:\n{agenda}"
         
-        # Suporte padrão CSV 1
-        csv1, _, _ = carregar_dados_locais()
-        contexto_final += f"\n[DADOS GERAIS]:\n{csv1}"
-        logs_execucao.append("✅ Fontes selecionadas consolidadas com sucesso.")
+        csv_geral, _ = carregar_dados_academicos(username)
+        contexto_final += f"\n[DADOS COMPLEMENTARES]:\n{csv_geral}"
+        logs.append("✅ Contexto de estudos estruturado com sucesso.")
 
-    return contexto_final, logs_execucao
+    return contexto_final, logs
 
-# --- APLICAÇÃO STREAMLIT ---
+# --- TELA DE LOGIN E CADASTRO ---
+def tela_autenticacao():
+    st.set_page_config(page_title="Login - Tutor Acadêmico", page_icon="🔐", layout="centered")
+    st.title("🔐 Portal do Estudante - Agente IA")
+    st.write("Faça login para acessar seu assistente de estudos e cronograma acadêmico.")
 
-def main():
-    st.set_page_config(page_title="Agente IA Sênior - Orquestração", page_icon="🤖", layout="centered")
+    aba_login, aba_cadastro = st.tabs(["🔑 Entrar", "📝 Criar Conta"])
 
-    st.title("🤖 Agente Virtual Inteligente (Com Orquestração em Tempo Real)")
-    st.write("Sistema RAG avançado com roteamento de ferramentas, fluxos combinados e fallbacks.")
+    with aba_login:
+        with st.form("form_login"):
+            usuario = st.text_input("Usuário")
+            senha = st.text_input("Senha", type="password")
+            submit_login = st.form_submit_button("Entrar")
 
-    inicializar_banco_historico()
-    historico = carregar_historico()
+            if submit_login:
+                if autenticar_usuario(usuario, senha):
+                    st.session_state["autenticado"] = True
+                    st.session_state["usuario"] = usuario
+                    st.success("Login realizado com sucesso! Entrando...")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("Usuário ou senha incorretos.")
 
-    for mensagem in historico:
-        with st.chat_message(mensagem["role"]):
-            st.markdown(mensagem["content"])
+    with aba_cadastro:
+        with st.form("form_cadastro"):
+            novo_usuario = st.text_input("Escolha um Usuário")
+            nova_senha = st.text_input("Escolha uma Senha", type="password")
+            submit_cadastro = st.form_submit_button("Cadastrar")
 
-    if pergunta := st.chat_input("Digite sua dúvida, endereço ou consulta de dados..."):
-        if not ENDPOINT or not API_KEY or not GPT5_MODEL:
-            st.error("Erro de configuração: Variáveis da Azure ausentes no ambiente.")
-            return
+            if submit_cadastro:
+                if not novo_usuario.strip() or not nova_senha.strip():
+                    st.warning("Preencha todos os campos!")
+                else:
+                    sucesso, msg = cadastrar_usuario(novo_usuario, nova_senha)
+                    if sucesso:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
 
-        if not client:
-            st.error("Erro crítico: Cliente Azure OpenAI não inicializado.")
-            return
+# --- APLICAÇÃO PRINCIPAL (TUTOR ACADÊMICO) ---
+def main_app():
+    st.set_page_config(page_title="Tutor Acadêmico IA", page_icon="🎓", layout="centered")
 
-        with st.chat_message("user"):
-            st.markdown(pergunta)
-        salvar_mensagem("user", pergunta)
+    with st.sidebar:
+        st.write(f"🎓 Estudante: **{st.session_state['usuario']}**")
+        if st.button("🚪 Sair"):
+            st.session_state["autenticado"] = False
+            st.session_state["usuario"] = None
+            st.rerun()
 
-        # Caixa transparente interativa mostrando à professora exatamente o que o agente tá fazendo por trás
-        with st.status("🧠 Agente analisando e executando orquestração...", expanded=True) as status:
-            time.sleep(0.5)
-            contexto_orquestrado, logs = orquestrar_com_logs(pergunta)
-            for log in logs:
-                st.write(log)
-                time.sleep(0.3)
-            status.update(label="✅ Orquestração concluída com sucesso!", state="complete", expanded=False)
+    st.title("🎓 Tutor Acadêmico & Organizador de Estudos")
+    st.write("Seu assistente inteligente com RAG, orquestração de matérias, tarefas e visão computacional.")
 
-        prompt_sistema = f"""
-Você é um agente de inteligência artificial sênior e especialista em atendimento.
-Utilize exclusivamente as informações fornecidas abaixo para responder à dúvida do usuário com precisão. Se o dado não estiver disponível, informe educadamente.
+    aba_chat, aba_visao = st.tabs(["💬 Tutor de Estudos (RAG)", "👁️ Analisador de Exercícios (Visão)"])
 
+    with aba_chat:
+        usuario_atual = st.session_state["usuario"]
+        historico = carregar_historico_orm(usuario_atual)
+
+        for mensagem in historico:
+            with st.chat_message(mensagem["role"]):
+                st.markdown(mensagem["content"])
+
+        if pergunta := st.chat_input("Tire uma dúvida de matéria ou consulte suas tarefas..."):
+            if not ENDPOINT or not API_KEY or not GPT5_MODEL:
+                st.error("Erro de configuração: Variáveis da Azure ausentes.")
+                return
+
+            if not client:
+                st.error("Erro crítico: Cliente Azure não inicializado.")
+                return
+
+            with st.chat_message("user"):
+                st.markdown(pergunta)
+            salvar_historico_orm(usuario_atual, "user", pergunta)
+
+            with st.status("🧠 Agente organizando bases de estudo...", expanded=True) as status:
+                time.sleep(0.4)
+                contexto_orquestrado, logs = orquestrar_estudos(pergunta, usuario_atual)
+                for log in logs:
+                    st.write(log)
+                    time.sleep(0.2)
+                status.update(label="✅ Orquestração acadêmica concluída!", state="complete", expanded=False)
+
+            prompt_sistema = f"""
+Você é um Tutor Acadêmico e Agente de Inteligência Artificial sênior especializado em apoiar estudantes. 
+Responda com didática, clareza e precisão utilizando exclusivamente os dados institucionais e de cronograma abaixo:
 {contexto_orquestrado}
 """
 
-        mensagens_api = [{"role": "system", "content": prompt_sistema}]
-        for m in historico[-6:]:
-            mensagens_api.append({"role": m["role"], "content": m["content"]})
-        mensagens_api.append({"role": "user", "content": pergunta})
+            mensagens_api = [{"role": "system", "content": prompt_sistema}]
+            for m in historico[-6:]:
+                mensagens_api.append({"role": m["role"], "content": m["content"]})
+            mensagens_api.append({"role": "user", "content": pergunta})
 
-        max_tentativas = 3
-        resposta_texto = ""
+            max_tentativas = 3
+            resposta_texto = ""
 
-        for tentativa in range(max_tentativas):
-            try:
-                with st.spinner(f"Gerando resposta com a Azure (Tentativa {tentativa+1})..."):
-                    response = client.chat.completions.create(
-                        model=GPT5_MODEL,
-                        messages=mensagens_api,
-                        max_completion_tokens=800
-                    )
-                    resposta_texto = response.choices[0].message.content
-                    break
-            except APIError as e:
-                if getattr(e, 'status_code', None) == 429 or "429" in str(e):
-                    if tentativa < max_tentativas - 1:
-                        time.sleep(5)
+            for tentativa in range(max_tentativas):
+                try:
+                    with st.spinner(f"Elaborando explicação... (Tentativa {tentativa+1})"):
+                        response = client.chat.completions.create(
+                            model=GPT5_MODEL,
+                            messages=mensagens_api,
+                            max_completion_tokens=800
+                        )
+                        resposta_texto = response.choices[0].message.content
+                        break
+                except APIError as e:
+                    if getattr(e, 'status_code', None) == 429 or "429" in str(e):
+                        if tentativa < max_tentativas - 1:
+                            time.sleep(5)
+                        else:
+                            resposta_texto = "Limite de tokens atingido. Tente novamente em instantes."
                     else:
-                        resposta_texto = "Limite de tokens atingido (Rate Limit 429). Tente novamente em instantes."
-                else:
-                    resposta_texto = f"Erro na API Azure: {e}"
-                    break
-            except Exception as e:
-                if tentativa < max_tentativas - 1:
-                    time.sleep(3)
-                else:
-                    resposta_texto = f"Erro temporário de conexão: {e}. Tente novamente."
-                    break
+                        resposta_texto = f"Erro na API Azure: {e}"
+                        break
+                except Exception as e:
+                    if tentativa < max_tentativas - 1:
+                        time.sleep(3)
+                    else:
+                        resposta_texto = f"Erro temporário de conexão: {e}."
+                        break
 
-        with st.chat_message("assistant"):
-            st.markdown(resposta_texto)
-        salvar_mensagem("assistant", resposta_texto)
+            with st.chat_message("assistant"):
+                st.markdown(resposta_texto)
+            salvar_historico_orm(usuario_atual, "assistant", resposta_texto)
 
+    with aba_visao:
+        st.subheader("Análise de Questões e Imagens Acadêmicas")
+        st.write("Envie a foto de uma questão, gráfico ou anotação para o tutor explicar passo a passo.")
+
+        uploaded_file = st.file_uploader("Escolha uma imagem (PNG, JPG, JPEG)", type=["png", "jpg", "jpeg"])
+
+        if uploaded_file is not None:
+            st.image(uploaded_file, caption="Exercício enviado", width='stretch')
+
+            if st.button("Explicar Exercício"):
+                if not client:
+                    st.error("Erro crítico: Cliente Azure não inicializado.")
+                    return
+
+                try:
+                    with st.spinner("Analisando imagem com Visão Computacional..."):
+                        bytes_dados = uploaded_file.getvalue()
+                        base64_imagem = base64.b64encode(bytes_dados).decode("utf-8")
+                        mime_type = uploaded_file.type
+
+                        response = client.chat.completions.create(
+                            model=GPT5_MODEL,
+                            messages=[
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text", 
+                                            "text": "Você é um professor tutor especialista. Analise esta imagem de caráter acadêmico/estudantil, identifique o problema, questão ou diagrama apresentado e explique detalhadamente a resolução passo a passo para o aluno."
+                                        },
+                                        {
+                                            "type": "image_url",
+                                            "image_url": {
+                                                "url": f"data:{mime_type};base64,{base64_imagem}"
+                                            }
+                                        }
+                                    ]
+                                }
+                            ],
+                            max_completion_tokens=800
+                        )
+                        
+                        resultado_visao = response.choices[0].message.content
+                        st.markdown("### Resolução do Tutor:")
+                        st.success(resultado_visao)
+
+                except APIError as e:
+                    st.error(f"Erro na API do Azure (Visão): {e}")
+                except Exception as e:
+                    st.error(f"Erro inesperado na visão computacional: {e}")
+
+# --- CONTROLE DE SESSÃO GLOBAL ---
 if __name__ == "__main__":
-    main()
+    if "autenticado" not in st.session_state:
+        st.session_state["autenticado"] = False
+
+    if not st.session_state["autenticado"]:
+        tela_autenticacao()
+    else:
+        main_app()
